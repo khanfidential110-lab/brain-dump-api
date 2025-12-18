@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Literal, Optional, List
+from typing import Literal, Optional, List, Dict
 
 class ProcessRequest(BaseModel):
     text: str
@@ -35,4 +35,5 @@ class SocialRequest(BaseModel):
 class AskRequest(BaseModel):
     query: str
     context_items: List[BrainItem]
+    history: List[Dict[str, str]] = []
 

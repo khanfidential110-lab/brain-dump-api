@@ -6,17 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from typing import List, Dict
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import JsonOutputParser
 
 # Import models
-# Note: If running this file directly, ensure 'models.py' is in the Python path.
 from models import ProcessRequest, ProcessResponse, BrainItem, SocialRequest, BreakdownRequest, BreakdownResponse, AskRequest
 
 app = FastAPI()
 
-# Mount API routes heavily first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,61 +24,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SERVE FLUTTER WEB APP
-# Must come after API routes or be mounted specifically? 
-# Best practice: Mount static on / and have API on /api or similar.
-# But for this MVP root dump, we can just serve static fallback.
-
-# We will mount static files for assets
 frontend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../frontend/build/web"))
 if os.path.exists(frontend_path):
     app.mount("/static", StaticFiles(directory=frontend_path), name="static")
 
 @app.get("/")
 async def read_root():
-    # Return index.html if exists, else API msg
     index_path = os.path.join(frontend_path, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"message": "Brain Dump Backend is Live (Web App build not found)"}
 
-# Serve other static files (js, css, etc) from root if not matching API
-# This acts as a catch-all for the Single Page App (SPA)
-@app.get("/{full_path:path}")
-async def serve_static(full_path: str):
-    # Check if file exists in build/web
-    file_path = os.path.join(frontend_path, full_path)
-    if os.path.exists(file_path):
-        return FileResponse(file_path)
-    # SPA Fallback for routes managed by Flutter
-    index_path = os.path.join(frontend_path, "index.html")
-    if os.path.exists(index_path):
-         return FileResponse(index_path)
-    return {"error": "File not found"}
 
-# --- LangChain Setup ---
 
-# SWITCHED TO GROQ (Cloud API - Fast & Reliable)
-from langchain_groq import ChatGroq
-import os
+# --- LangChain & Groq Setup ---
 
-# Get Groq API Key from environment (set in Render dashboard)
-# DO NOT hardcode API keys - set GROQ_API_KEY environment variable
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY not set. AI features will not work.")
 
-# Initialize Groq with Llama 3.3 70B (fast & powerful)
-try:
-    llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
-    print("Connected to Groq Cloud API (Llama 3.3 70B)")
-except Exception as e:
-    print(f"Warning: Could not connect to Groq: {e}")
-    llm = None
+# Fallback Models List (Priority Order)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+]
 
-# System Prompt
-# We strictly enforce JSON output using the schema from our Pydantic models (implicitly)
-# but explicitly in the prompt for the LLM to follow.
 SYSTEM_PROMPT = """
 You are an intelligent assistant for the "Brain Dump" app, designed to help people with ADHD organize their thoughts.
 Your goal is to parse unstructured thoughts into structured lists with helpful metadata.
@@ -134,45 +105,127 @@ Example Output:
 Only output valid JSON. No preambles.
 """
 
-prompt = ChatPromptTemplate.from_messages([
+# Global Prompt Objects
+dump_prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
     ("human", "{text}")
 ])
+try:
+    dump_parser = JsonOutputParser(pydantic_object=ProcessResponse)
+except Exception as e:
+    print(f"Validation Error init parser: {e}")
+    dump_parser = None
 
-# Using JsonOutputParser to help with parsing (though we'll do manual fallback too for safety)
-parser = JsonOutputParser(pydantic_object=ProcessResponse)
+# --- Helper Function for Robustness ---
 
-# Initialize chain only if LLM is available
-if llm:
-    chain = prompt | llm | parser
-else:
-    chain = None
+# --- Helper Function for Robustness ---
+
+def extract_json(content: str):
+    """Attempt to extract JSON from a string (even with markdown blocks)."""
+    try:
+        content = content.strip()
+        # Remove Markdown
+        if "```" in content:
+            start = content.find('[') if '[' in content else content.find('{')
+            end = content.rfind(']') if ']' in content else content.rfind('}')
+            if start != -1 and end != -1:
+                content = content[start:end+1]
+        
+        # Simple bounds check
+        if not (content.startswith('{') or content.startswith('[')):
+            # Try finding first { or [
+            start_obj = content.find('{')
+            start_arr = content.find('[')
+            
+            start = -1
+            if start_obj != -1 and start_arr != -1:
+                start = min(start_obj, start_arr)
+            elif start_obj != -1:
+                start = start_obj
+            elif start_arr != -1:
+                start = start_arr
+                
+            if start != -1:
+                content = content[start:]
+                end_obj = content.rfind('}')
+                end_arr = content.rfind(']')
+                end = max(end_obj, end_arr)
+                if end != -1:
+                    content = content[:end+1]
+
+        return json.loads(content)
+    except Exception as e:
+        print(f"JSON Parsing Error: {e} \nContent: {content[:100]}...")
+        return None
+
+async def run_groq(input_data=None, prompt_obj=None, parser_obj=None, raw_prompt_str=None):
+    """
+    Executes Groq LLM with automatic model switching on rate limit (403/429).
+    Returns the raw AIMessage content or parsed dict depending on args.
+    """
+    if not GROQ_API_KEY:
+         raise HTTPException(status_code=503, detail="Groq API Key missing")
+
+    for model_name in GROQ_MODELS:
+        try:
+            # Init LLM
+            llm = ChatGroq(model_name=model_name, temperature=0, groq_api_key=GROQ_API_KEY)
+            
+            response = None
+            if raw_prompt_str:
+                response = llm.invoke(raw_prompt_str)
+            elif prompt_obj:
+                if parser_obj:
+                    # Try to use parser if available
+                    chain = prompt_obj | llm | parser_obj
+                    return chain.invoke(input_data)
+                else:
+                    # No parser, just get message
+                    chain = prompt_obj | llm
+                    response = chain.invoke(input_data)
+            
+            # Extract content from AIMessage
+            if hasattr(response, 'content'):
+                return response.content
+            return response
+
+        except Exception as e:
+            err = str(e).lower()
+            # Catch 403 (Forbidden/Limit) and 429 (Too Many Requests)
+            if "403" in err or "rate limit" in err or "429" in err:
+                print(f"⚠️ Model {model_name} rate limited. Switching to next...")
+                continue # Try next
+            else:
+                print(f"❌ Model {model_name} error (non-rate-limit): {e}")
+                raise e # Stop for non-rate-limit errors
+    
+    raise HTTPException(status_code=503, detail="AI Service Busy (Rate Limit). Please try again in a moment.")
+
+# --- Endpoints ---
 
 @app.post("/process-dump", response_model=ProcessResponse)
 async def process_dump(request: ProcessRequest):
-    if not llm:
-        raise HTTPException(status_code=500, detail="LLM not initialized. Please ensure Ollama is running.")
-    
     try:
-        # Invoke the chain
-        if not chain:
-             raise Exception("LLM Chain not initialized")
-        result = chain.invoke({"text": request.text})
+        # Pass None as parser since verify failed earlier
+        result_text = await run_groq(
+            input_data={"text": request.text}, 
+            prompt_obj=dump_prompt, 
+            parser_obj=None 
+        )
         
-        # result should be a dict matching ProcessResponse (thanks to JsonOutputParser)
-        # We validate it through Pydantic to be sure
-        return ProcessResponse(**result)
-
+        data = extract_json(result_text)
+        if not data:
+             # Fallback
+             return ProcessResponse(items=[BrainItem(type="note", content=request.text, summary="Note")])
+             
+        return ProcessResponse(**data)
     except Exception as e:
         print(f"Error processing dump: {e}")
-        # In case of parsing error or hallucination that breaks JSON
-        raise HTTPException(status_code=500, detail=f"AI Processing Failed: {str(e)}")
+        # Return fallback instead of 500
+        return ProcessResponse(items=[BrainItem(type="note", content=request.text, summary="Error processing")])
 
 @app.post("/social-draft")
 async def draft_social_post(request: SocialRequest):
-    if not llm:
-        raise HTTPException(status_code=503, detail="Ollama not available")
-    
     prompt = f"""
     You are a social media expert. Rewrite the following thought into a viral, engaging post for {request.platform.upper()}.
     
@@ -186,19 +239,14 @@ async def draft_social_post(request: SocialRequest):
     
     Output ONLY the post text. No "Here is the post" preamble.
     """
-    
     try:
-        response = llm.invoke(prompt)
-        return {"draft": response.content.strip().strip('"')} # Remove quotes if AI adds them
+        response_text = await run_groq(raw_prompt_str=prompt)
+        return {"draft": response_text.strip().strip('"')}
     except Exception as e:
-        print(f"Error drafting: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/break-down", response_model=BreakdownResponse)
 async def break_down_task(request: BreakdownRequest):
-    if not llm:
-        raise HTTPException(status_code=503, detail="Ollama not available")
-    
     prompt = f"""
     You are an expert productivity coach using the "GTD" method. 
     Break down the following complex task into 3-5 smaller, concrete, actionable steps.
@@ -210,78 +258,96 @@ async def break_down_task(request: BreakdownRequest):
     
     Output ONLY a valid JSON list of strings. No extra text.
     """
-    
     try:
-        response = llm.invoke(prompt)
-        # Clean response to ensure only the list part is parsed
-        content = response.content.strip()
+        response_text = await run_groq(raw_prompt_str=prompt)
+        content = response_text.strip()
+        data = extract_json(content)
         
-        # Remove markdown code blocks if present
-        if "```" in content:
-            # Find the first [ and the last ]
-            start = content.find('[')
-            end = content.rfind(']')
-            if start != -1 and end != -1:
-                content = content[start:end+1]
-            else:
-                # Fallback: try to just lines that look like items
-                lines = content.split('\n')
-                params = [line.strip().strip('- "') for line in lines if line.strip()]
-                return BreakdownResponse(subtasks=params)
-            
-        subtasks = json.loads(content)
-        return BreakdownResponse(subtasks=subtasks)
+        if data and isinstance(data, list):
+             return BreakdownResponse(subtasks=data)
+        
+        # Fallback if no JSON
+        lines = content.split('\n')
+        params = [line.strip().strip('- "') for line in lines if line.strip()]
+        return BreakdownResponse(subtasks=params)
+
     except Exception as e:
         print(f"Error breaking down: {e}")
-        # Fallback if JSON fails - return a generic split
-        fallback = request.task_content.split(' and ')
-        if len(fallback) > 1:
-             return BreakdownResponse(subtasks=fallback)
         return BreakdownResponse(subtasks=["Identify next step", "Execute task", "Verify result"])
 
 @app.post("/ask")
 async def ask_brain(request: AskRequest):
-    if not llm:
-        raise HTTPException(status_code=503, detail="Ollama not available")
+    # Construct context
+    context_parts = []
+    for item in request.context_items:
+        item_str = f"• {item.summary or item.content}"
+        if item.tags:
+            item_str += f" (Tags: {', '.join(item.tags)})"
+        if item.due_date:
+            item_str += f" [Due: {item.due_date}]"
+        context_parts.append(item_str)
     
-    # Construct context from brain items
-    context_str = "\\n".join([f"- {item.type.upper()}: {item.content} (Status: {item.status})" for item in request.context_items])
+    context_str = "\n".join(context_parts) if context_parts else "No notes available."
     
-    prompt = f"""
-    You are the user's "Second Brain". You have access to their notes and tasks.
-    Answer the following question based ONLY on the context provided below.
+    history_str = ""
+    if request.history:
+        history_parts = []
+        for msg in request.history[-10:]:
+             role = "User" if msg.get('role') == 'user' else "Meera"
+             history_parts.append(f"{role}: {msg.get('content')}")
+        history_str = "\n".join(history_parts)
     
-    Context:
-    {context_str}
-    
-    Question: "{request.query}"
-    
-    Answer clearly and concisely. If the answer is not in the context, say "I don't see that in your notes."
-    """
+    prompt = f"""You are Meera, a friendly and helpful AI assistant for the "My Dump Space" app. 
+You help users organize their thoughts, tasks, and notes.
+
+The user has the following items in their notes:
+{context_str}
+
+Conversation History:
+{history_str}
+
+User's New Question: "{request.query}"
+
+Instructions:
+- Answer the question directly and helpfully
+- Be conversational and friendly
+- Use emojis occasionally to be friendly 😊
+- Keep responses concise but helpful (2-4 sentences)
+- USE THE CONVERSATION HISTORY to understand context.
+
+Your response:"""
     
     try:
-        response = llm.invoke(prompt)
-        # Handle potential response object structure (content string vs object)
-        answer_text = response.content if hasattr(response, 'content') else str(response)
-        return {"answer": answer_text.strip()}
+        response_text = await run_groq(raw_prompt_str=prompt)
+        return {"answer": response_text.strip()}
     except Exception as e:
         print(f"Error asking brain: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-# 4. Serve Flutter Web (Static Files)
-# Must be AFTER API routes so API takes precedence
 if os.path.isdir("web_build"):
     app.mount("/", StaticFiles(directory="web_build", html=True), name="static")
 
 @app.exception_handler(404)
 async def not_found(request, exc):
-    # Fallback to index.html for Flutter routing (if needed)
     return FileResponse('web_build/index.html')
+
+@app.get("/{full_path:path}")
+async def serve_static(full_path: str):
+    # Skip API routes (just in case, though order should handle it)
+    if full_path.startswith("api/") or full_path in ["process-dump", "ask", "social-draft", "break-down", "health"]:
+        raise HTTPException(status_code=404, detail="Not Found")
+        
+    file_path = os.path.join(frontend_path, full_path)
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    index_path = os.path.join(frontend_path, "index.html")
+    if os.path.exists(index_path):
+         return FileResponse(index_path)
+    return {"error": "File not found"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
